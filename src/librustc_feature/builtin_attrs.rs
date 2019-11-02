@@ -536,6 +536,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // Internal attributes, Testing:
     // ==========================================================================
 
+    rustc_attr!(TEST, rustc_dyn, Whitelisted, template!(Word)),
     rustc_attr!(TEST, rustc_outlives, Normal, template!(Word)),
     rustc_attr!(TEST, rustc_variance, Normal, template!(Word)),
     rustc_attr!(TEST, rustc_layout, Normal, template!(List: "field1, field2, ...")),

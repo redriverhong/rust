@@ -12,11 +12,11 @@ use super::elaborate_predicates;
 
 use crate::traits::{self, Obligation, ObligationCause};
 use crate::ty::subst::{InternalSubsts, Subst};
-use crate::ty::{self, Predicate, ToPredicate, Ty, TyCtxt, TypeFoldable};
+use crate::ty::{self, ParamTy, Predicate, ToPredicate, Ty, TyCtxt, TypeFoldable};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_session::lint::builtin::WHERE_CLAUSES_OBJECT_SAFETY;
-use rustc_span::symbol::Symbol;
+use rustc_span::symbol::{sym, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 use syntax::ast;
 
@@ -269,6 +269,66 @@ fn predicates_reference_self(tcx: TyCtxt<'_>, trait_def_id: DefId, supertraits_o
         })
 }
 
+fn generics_require_sized_param(tcx: TyCtxt<'_>, def_id: DefId, param_ty: ParamTy) -> bool {
+    debug!("generics_require_sized_param(def_id={:?}, param_ty={:?})", def_id, param_ty);
+
+    let sized_def_id = match tcx.lang_items().sized_trait() {
+        Some(def_id) => def_id,
+        None => {
+            return false; /* No Sized trait, can't require it! */
+        }
+    };
+
+    // Search for a predicate like `Self : Sized` amongst the trait bounds.
+    let predicates = tcx.predicates_of(def_id);
+    let predicates = predicates.instantiate_identity(tcx).predicates;
+    predicates.iter().any(|predicate| match predicate {
+        ty::Predicate::Trait(ref trait_pred) => {
+            debug!("generics_require_sized_param: trait_pred = {:?}", trait_pred);
+
+            trait_pred.def_id() == sized_def_id
+                && trait_pred.skip_binder().self_ty().is_param(param_ty.index)
+        }
+        ty::Predicate::Projection(..)
+        | ty::Predicate::Subtype(..)
+        | ty::Predicate::RegionOutlives(..)
+        | ty::Predicate::WellFormed(..)
+        | ty::Predicate::ObjectSafe(..)
+        | ty::Predicate::ClosureKind(..)
+        | ty::Predicate::TypeOutlives(..)
+        | ty::Predicate::ConstEvaluatable(..) => false,
+    })
+}
+
+/// Searches for an impl that potentially overlaps `dyn Trait`
+/// (where `Trait` is the trait with def-id `trait_def_id`). This
+/// is used to distinguish between a trait being **fully**
+/// object-safe and being **degenerate** object-safe -- the latter
+/// means that we permit `dyn Foo` but we do not supply a `dyn
+/// Foo: Foo` impl.
+fn impl_potentially_overlapping_dyn_trait(tcx: TyCtxt<'_>, trait_def_id: DefId) -> bool {
+    debug!("impl_potentially_overlapping_dyn_trait({:?})", trait_def_id);
+    let mut found_match = false;
+    tcx.for_each_impl(trait_def_id, |impl_def_id| {
+        let impl_self_ty = tcx.type_of(impl_def_id);
+        match impl_self_ty.kind {
+            ty::Param(param_ty) => {
+                if !generics_require_sized_param(tcx, impl_def_id, param_ty) {
+                    found_match = true;
+                    debug!("Match found = {}; for param_ty {}", found_match, param_ty.name);
+                    tcx.sess.span_warn(
+                        tcx.def_span(impl_def_id),
+                        "impl_potentially_overlapping_dyn_trait",
+                    );
+                }
+            }
+            _ => (),
+        }
+    });
+
+    found_match
+}
+
 fn trait_has_sized_self(tcx: TyCtxt<'_>, trait_def_id: DefId) -> bool {
     generics_require_sized_self(tcx, trait_def_id)
 }
@@ -417,7 +477,7 @@ fn virtual_call_violation_for_method<'tcx>(
                         tcx.def_span(method.def_id),
                         &format!(
                             "receiver when `Self = {}` should have a ScalarPair ABI; \
-                                 found {:?}",
+                             found {:?}",
                             trait_object_ty, abi
                         ),
                     );
@@ -716,7 +776,7 @@ fn contains_illegal_self_type_reference<'tcx>(
                 }
             }
 
-            _ => true, // walk contained types, if any
+            _ => true,
         }
     });
 
@@ -724,5 +784,29 @@ fn contains_illegal_self_type_reference<'tcx>(
 }
 
 pub(super) fn is_object_safe_provider(tcx: TyCtxt<'_>, trait_def_id: DefId) -> bool {
-    object_safety_violations(tcx, trait_def_id).is_empty()
+    object_safety_violations(tcx, trait_def_id).is_empty() && {
+        if tcx.has_attr(trait_def_id, sym::rustc_dyn) {
+            true
+        } else {
+            // Issue #57893. A trait cannot be considered dyn-safe if:
+            //
+            // (a) it has associated items that are not functions and
+            // (b) it has a potentially dyn-overlapping impl.
+            //
+            // Why don't functions matter? Because we never resolve
+            // them to their normalizd type until code generation
+            // time, in short.
+            let has_associated_non_fn = traits::supertrait_def_ids(tcx, trait_def_id)
+                .flat_map(|def_id| tcx.associated_items(def_id))
+                .any(|assoc_item| match assoc_item.kind {
+                    ty::AssocKind::Method => false,
+                    ty::AssocKind::Type | ty::AssocKind::OpaqueTy | ty::AssocKind::Const => true,
+                });
+
+            let not_object_safe =
+                has_associated_non_fn && impl_potentially_overlapping_dyn_trait(tcx, trait_def_id);
+
+            !not_object_safe
+        }
+    }
 }
